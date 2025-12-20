@@ -4,7 +4,7 @@ import os
 import subprocess
 import whisper
 import pandas as pd
-from pytube import YouTube
+# from pytube import YouTube (Removed as we use yt-dlp in main.py)
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 import re
 import torch
@@ -16,10 +16,15 @@ import string
 from scipy.io.wavfile import write
 import sys
 
-sys.path.append('/home/shubhankar/Project/VAKYANSH_TTS')
+# sys.path.append('/home/shubhankar/Project/VAKYANSH_TTS')
+vakyansh_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'VAKYANSH_TTS'))
+sys.path.append(vakyansh_path)
 from tts_infer.tts import TextToMel, MelToWav
 from tts_infer.transliterate import XlitEngine
 from tts_infer.num_to_word_on_sent import normalize_nums
+
+# Global cache for TTS models to avoid reloading on every request
+tts_model_cache = {}
 
 
 
@@ -339,11 +344,19 @@ def logout():
 
 def get_captions(file_path):
     audio = whisper.load_audio(file_path)
-    transcription = asr_model.transcribe(audio, **transcribe_options)
-    df = pd.DataFrame()
-    for i, segment in enumerate(transcription['segments']):
-        new_row =  {'START' : segment['start'], 'END' : segment['end'], 'TEXT' : segment['text'] }
-        df = df.append(new_row, ignore_index=True)
+    # Using beam_size=1 and best_of=1 to resolve "cannot reshape tensor of 0 elements" error on CPU
+    # with certain torch/whisper/python 3.14 combinations.
+    options = transcribe_options.copy()
+    options['beam_size'] = 1
+    options['best_of'] = 1
+    
+    transcription = asr_model.transcribe(audio, **options)
+    
+    rows = []
+    for segment in transcription['segments']:
+        rows.append({'START' : segment['start'], 'END' : segment['end'], 'TEXT' : segment['text'] })
+    
+    df = pd.DataFrame(rows)
     return df
 
 def convert_floats(row):
@@ -421,9 +434,9 @@ def run_tts(text, lang='hi',count=0):
     mel = text_to_mel.generate_mel(text_num_to_word_and_transliterated)
     audio, sr = mel_to_wav.generate_wav(mel)
 
-    fName = f'{count+1}.wav'
+    fName = f'temp_{count+1}_{random.randint(1000, 9999)}.wav'
     write(filename=fName, rate=sr, data=audio) # for saving wav file, if needed
-    audio_file_path = os.path.join(os.getcwd()+'/'+fName)
+    audio_file_path = os.path.abspath(fName)
     return audio_file_path
 
 
@@ -443,8 +456,12 @@ def translate_video(video_path,language_voice,gender_voice,output_path):
     language_voice= language_voice.lower()
     gender_voice = gender_voice.lower()
 
-    glow_model_dir=f'/home/shubhankar/Project/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/glow_ckp'
-    hifi_model_dir=f'/home/shubhankar/Project/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/hifi_ckp'
+    # glow_model_dir=f'/home/shubhankar/Project/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/glow_ckp'
+    # hifi_model_dir=f'/home/shubhankar/Project/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/hifi_ckp'
+    
+    vakyansh_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'VAKYANSH_TTS'))
+    glow_model_dir = os.path.join(vakyansh_path, 'tts_infer', 'translit_models', language_voice, gender_voice, 'glow_ckp')
+    hifi_model_dir = os.path.join(vakyansh_path, 'tts_infer', 'translit_models', language_voice, gender_voice, 'hifi_ckp')
 
     print('#'*200)
     print(language_voice)
@@ -453,11 +470,25 @@ def translate_video(video_path,language_voice,gender_voice,output_path):
     print(hifi_model_dir)
     print('#'*200)
 
-    global text_to_mel
-    global mel_to_wav
+    global tts_model_cache
+    
+    model_key = f"{language_voice}_{gender_voice}"
+    
+    if model_key not in tts_model_cache:
+        print(f"Loading TTS models for {model_key}...")
+        if not os.path.exists(glow_model_dir) or not os.listdir(glow_model_dir):
+            raise FileNotFoundError(f"Missing Glow model directory: {glow_model_dir}. Please download the models as per README.")
+        if not os.path.exists(hifi_model_dir) or not os.listdir(hifi_model_dir):
+            raise FileNotFoundError(f"Missing HiFi model directory: {hifi_model_dir}. Please download the models as per README.")
 
-    text_to_mel = TextToMel(glow_model_dir=glow_model_dir, device=device)
-    mel_to_wav = MelToWav(hifi_model_dir=hifi_model_dir, device=device)
+        global text_to_mel
+        global mel_to_wav
+
+        text_to_mel_instance = TextToMel(glow_model_dir=glow_model_dir, device=device)
+        mel_to_wav_instance = MelToWav(hifi_model_dir=hifi_model_dir, device=device)
+        tts_model_cache[model_key] = (text_to_mel_instance, mel_to_wav_instance)
+    
+    text_to_mel, mel_to_wav = tts_model_cache[model_key]
 
 
 
@@ -474,15 +505,20 @@ def translate_video(video_path,language_voice,gender_voice,output_path):
         print('Oooooooooooooooooooooooooooooooooooooooooooops')
 
 
-    command = "sox $(ls *.wav | sort -n ) output.wav"
-    os.system(command)
+    wav_files = sorted([f for f in os.listdir('.') if f.startswith('temp_') and f.endswith('.wav')], key=lambda x: int(x.split('_')[1]))
+    if wav_files:
+        sox_command = ["sox"] + wav_files + ["output.wav"]
+        subprocess.run(sox_command, check=True)
 
+        ffmpeg_command = [
+            "ffmpeg", "-y", "-i", video_path, "-i", "output.wav",
+            "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", output_path
+        ]
+        subprocess.run(ffmpeg_command, check=True)
 
-    command2 = f"ffmpeg -y -i {video_path} -i output.wav -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 {output_path}"
-    os.system(command2)
-
-    command3 = "rm *.wav"
-    os.system(command3)
+        for f in wav_files + ["output.wav"]:
+            if os.path.exists(f):
+                os.remove(f)
 
 
 
