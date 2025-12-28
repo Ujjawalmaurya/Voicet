@@ -426,6 +426,9 @@ def convert_floats(row):
     return ' '.join(words)
 
 
+import logging
+logger = logging.getLogger(__name__)
+
 def translate(df, src_lang="eng_Latn", tgt_lang="hin_Deva", max_batch_chars=400):
     """
     Translates segments in the dataframe.
@@ -439,69 +442,6 @@ def translate(df, src_lang="eng_Latn", tgt_lang="hin_Deva", max_batch_chars=400)
                                     tgt_lang=tgt_lang,
                                     max_length=400,
                                     device=device)
-
-    segments = df['TEXT'].tolist()
-    translated_segments = []
-    
-    # Context Batching Logic
-    current_batch = []
-    current_length = 0
-    batch_indices = []
-    
-    for i, text in enumerate(segments):
-        # If adding this text exceeds max_batch_chars, translate the current batch
-        if current_length + len(text) > max_batch_chars and current_batch:
-            # Join with spaces, translate, and split back
-            batch_text = " ".join(current_batch)
-            # We use a special separator that is unlikely to be in the text to help split back
-            # However, NLLB might not preserve custom separators well.
-            # A safer approach is to translate the whole chunk and then map back or 
-            # just translate the chunk and redistribute. 
-            # For now, we translate the whole chunk to get context, but NLLB-200 
-            # works best on single sentences/paragraphs.
-            
-            translated_chunk = translation_pipeline(batch_text)[0]['translation_text']
-            # Simple redistribution: if we have N segments, we try to split by punctuation 
-            # but that's risky. The most robust way for context is to translate 
-            # overlapping windows or just larger chunks and accept "blocky" subs.
-            
-            # IMPROVED STRATEGY: Batching for context but keeping translations mapped.
-            # actually, NLLB-200 does BETTER when it sees more text.
-            # Let's use a simpler heuristic: if segments are very short (< 50 chars), 
-            # merge them with the next one until we hit a reasonable block size.
-            pass
-
-    # Let's implement a robust "chunked" translation to avoid the overhead of 
-    # many small calls and provide context.
-    
-    input_texts = df['TEXT'].tolist()
-    outputs = []
-    
-    # Simple batching: process in groups of 3 segments or ~300 chars
-    i = 0
-    while i < len(input_texts):
-        chunk = []
-        chars = 0
-        ids_in_chunk = []
-        
-        while i < len(input_texts) and chars + len(input_texts[i]) < max_batch_chars and len(chunk) < 5:
-            chunk.append(input_texts[i])
-            chars += len(input_texts[i])
-            ids_in_chunk.append(i)
-            i += 1
-        
-        combined_text = " ".join(chunk)
-        # Translate the combined block
-        translated_block = translation_pipeline(combined_text)[0]['translation_text']
-        
-        # Now we need to split this back. This is the "Hard Part".
-        # If we can't accurately split, we can just assign the whole block 
-        # to the first segment and empty the others, but that's bad for timing.
-        
-        # Better: NLLB-200 often preserves punctuation. If we can find '.' or '?'
-        # we can try to split. For now, to ensure timing stays sane, we will
-        # translate segments individually BUT with a "context window" prefix.
-        pass
 
     # REVISED ROBUST APPROACH: Prepend previous segment as context (prefixing)
     # This is a common trick for NMT models.
@@ -519,23 +459,36 @@ def translate(df, src_lang="eng_Latn", tgt_lang="hin_Deva", max_batch_chars=400)
         # We don't want to translate the whole thing, just use it for context.
         # NLLB doesn't have a "context" parameter, so we just give it more text.
         
-        if previous_context:
-            full_input = f"{previous_context} {current_text}"
-            translated_full = translation_pipeline(full_input)[0]['translation_text']
-            
-            # Try to extract only the last part (the current segment's translation)
-            # This is tricky without knowing the alignment. 
-            # Let's stick to the batching where we join and then split by common sentence markers.
-            
-            output_value = translated_full # Fallback
-            # If the translation has a clear sentence break, take the last part
-            # (Very rough heuristic for Hindi/English)
-            if '।' in translated_full:
-                output_value = translated_full.split('।')[-1].strip()
-            elif '.' in translated_full:
-                 output_value = translated_full.split('.')[-1].strip()
-        else:
-            output_value = translation_pipeline(current_text)[0]['translation_text']
+        try:
+            if previous_context:
+                full_input = f"{previous_context} {current_text}"
+                result = translation_pipeline(full_input)
+                if result and len(result) > 0:
+                    translated_full = result[0]['translation_text']
+                    
+                    # Try to extract only the last part (the current segment's translation)
+                    # This is tricky without knowing the alignment. 
+                    
+                    output_value = translated_full # Fallback
+                    # If the translation has a clear sentence break, take the last part
+                    # (Very rough heuristic for Hindi/English)
+                    if '।' in translated_full:
+                        output_value = translated_full.split('।')[-1].strip()
+                    elif '.' in translated_full:
+                         output_value = translated_full.split('.')[-1].strip()
+                else:
+                    logger.warning(f"Translation returned empty result for: {full_input}")
+                    output_value = current_text
+            else:
+                result = translation_pipeline(current_text)
+                if result and len(result) > 0:
+                    output_value = result[0]['translation_text']
+                else:
+                    logger.warning(f"Translation returned empty result for: {current_text}")
+                    output_value = current_text
+        except Exception as e:
+            logger.error(f"Translation error at index {index}: {e}")
+            output_value = current_text # Fallback to original text on error
             
         output_column.append(output_value)
         previous_context = current_text
@@ -569,12 +522,12 @@ def run_tts(text, lang='hi',count=0):
 #    mel_to_wav = MelToWav(hifi_model_dir=hifi_model_dir, device=device)
 
 
-    print("Original Text from user: ", text)
+    logger.info(f"Original Text from user: {text}")
     if lang == 'hi':
         text = text.replace('।', '.') # only for hindi models
     text_num_to_word = normalize_nums(text, lang) # converting numbers to words in lang
     text_num_to_word_and_transliterated = translit(text_num_to_word, lang) # transliterating english words to lang
-    print("Text after preprocessing: ", text_num_to_word_and_transliterated)
+    logger.info(f"Text after preprocessing: {text_num_to_word_and_transliterated}")
 
 
     mel = text_to_mel.generate_mel(text_num_to_word_and_transliterated)
@@ -590,14 +543,14 @@ def run_tts(text, lang='hi',count=0):
 
 def translate_video(video_path,language_voice,gender_voice,output_path):
     df = get_captions(video_path)
-    print('*'*200)
-    print('Subtitles Generated')
+    logger.info('*'*50)
+    logger.info('Subtitles Generated')
     df['TEXT'] = df.apply(lambda row: convert_floats(row), axis=1)
     tgt_lang = flores_codes[language_voice.capitalize()]
     df2 = translate(df,tgt_lang=tgt_lang)
-    print('*'*200)
-    print('Subtitles Translated')
-    print(df2)
+    logger.info('*'*50)
+    logger.info('Subtitles Translated')
+    logger.info(df2.head())
 
     language_voice= language_voice.lower()
     gender_voice = gender_voice.lower()
@@ -609,12 +562,11 @@ def translate_video(video_path,language_voice,gender_voice,output_path):
     glow_model_dir = os.path.join(vakyansh_path, 'tts_infer', 'translit_models', language_voice, gender_voice, 'glow_ckp')
     hifi_model_dir = os.path.join(vakyansh_path, 'tts_infer', 'translit_models', language_voice, gender_voice, 'hifi_ckp')
 
-    print('#'*200)
-    print(language_voice)
-    print(gender_voice)
-    print(glow_model_dir)
-    print(hifi_model_dir)
-    print('#'*200)
+    logger.info('#'*50)
+    logger.info(f"Lang: {language_voice}, Gender: {gender_voice}")
+    logger.info(f"Glow: {glow_model_dir}")
+    logger.info(f"HiFi: {hifi_model_dir}")
+    logger.info('#'*50)
 
     global tts_model_cache
     
